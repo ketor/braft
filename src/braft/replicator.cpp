@@ -16,11 +16,22 @@
 //          Wang,Yao(wangyao02@baidu.com)
 //          Xiong,Kai(xiongkai@baidu.com)
 
+#include <brpc/channel.h>
+#include <butil/endpoint.h>
+#include <butil/scoped_lock.h>
+#include <cerrno>
+#include <cstdint>
 #include <gflags/gflags.h>                       // DEFINE_int32
 #include <butil/unique_ptr.h>                    // std::unique_ptr
 #include <butil/time.h>                          // butil::gettimeofday_us
 #include <brpc/controller.h>                     // brpc::Controller
 #include <brpc/reloadable_flags.h>               // BRPC_VALIDATE_GFLAG
+#include <map>
+#include <string>
+#include <vector>
+#include "braft/configuration_manager.h"
+#include "braft/raft.h"
+#include "braft/raft.pb.h"
 #include "braft/replicator.h"
 #include "braft/node.h"                          // NodeImpl
 #include "braft/ballot_box.h"                    // BallotBox 
@@ -595,6 +606,56 @@ void Replicator::_send_empty_entries(bool is_heartbeat) {
     CHECK_EQ(0, bthread_id_unlock(_id)) << "Fail to unlock " << _id;
 }
 
+void Replicator::_send_heartbeat_entries() {
+    bool is_heartbeat = true;
+
+    std::unique_ptr<brpc::Controller> cntl(new brpc::Controller);
+    std::unique_ptr<AppendEntriesRequest> request(new AppendEntriesRequest);
+    std::unique_ptr<AppendEntriesResponse> response(new AppendEntriesResponse);
+    if (_fill_common_fields(
+                request.get(), _next_index - 1, is_heartbeat) != 0) {
+        CHECK(!is_heartbeat);
+        // _id is unlock in _install_snapshot
+        return _install_snapshot();
+    }
+    if (is_heartbeat) {
+        _heartbeat_in_fly = cntl->call_id();
+        _heartbeat_counter++;
+        // set RPC timeout for heartbeat, how long should timeout be is waiting to be optimized.
+        cntl->set_timeout_ms(*_options.election_timeout_ms / 2);
+    } else {
+        _st.st = APPENDING_ENTRIES;
+        _st.first_log_index = _next_index;
+        _st.last_log_index = _next_index - 1;
+        CHECK(_append_entries_in_fly.empty());
+        CHECK_EQ(_flying_append_entries_size, 0);
+        _append_entries_in_fly.push_back(FlyingAppendEntriesRpc(_next_index, 0, cntl->call_id()));
+        _append_entries_counter++;
+    }
+
+    BRAFT_VLOG << "node " << _options.group_id << ":" << _options.server_id
+        << " send HeartbeatRequest to " << _options.peer_id 
+        << " term " << _options.term
+        << " prev_log_index " << request->prev_log_index()
+        << " last_committed_index " << request->committed_index();
+
+    google::protobuf::Closure* done = brpc::NewCallback(
+                is_heartbeat ? _on_heartbeat_returned : _on_rpc_returned, 
+                _id.value, cntl.get(), request.get(), response.get(),
+                butil::monotonic_time_ms());
+
+    HeartbeatTask task;
+    task.endpoint = this->_options.peer_id.addr;
+    task.cntl = cntl.release();
+    task.request = request.release();
+    task.response = response.release();
+    task.done = done;
+
+    HeartbeatQueue::GetInstance().add_task(task);
+
+    CHECK_EQ(0, bthread_id_unlock(_id)) << "Fail to unlock " << _id;
+}
+
 int Replicator::_prepare_entry(int offset, EntryMeta* em, butil::IOBuf *data) {
     if (data->length() >= (size_t)FLAGS_raft_max_body_size) {
         return ERANGE;
@@ -984,7 +1045,8 @@ void* Replicator::_send_heartbeat(void* arg) {
         return NULL;
     }
     // id is unlock in _send_empty_entries;
-    r->_send_empty_entries(true);
+    // r->_send_empty_entries(true);
+    r->_send_heartbeat_entries();
     return NULL;
 }
 
@@ -1583,6 +1645,195 @@ bool ReplicatorGroup::readonly(const PeerId& peer) const {
     }
     ReplicatorId rid = iter->second.id;
     return Replicator::readonly(rid);
+}
+
+DEFINE_int32(heartbeat_queue_timer_ms, 200, "heartbeat queue timer in ms");
+DEFINE_int32(heartbeat_default_timeout_ms, 1000, "heartbeat default timeout in ms");
+DEFINE_uint64(heartbeat_max_batch_count, 10000, "heartbeat max batch count");
+
+HeartbeatQueue::HeartbeatQueue() { 
+    bthread_mutex_init(&tasks_mutex_, nullptr);
+    bthread_mutex_init(&channels_mutex_, nullptr);
+    is_stop_ = false;
+    need_stop_ = false;
+
+    bthread_t tid;
+    if (bthread_start_urgent(&tid, nullptr, start_heartbeat,
+                                reinterpret_cast<void*>(this)) != 0) {
+        PLOG(ERROR) << "Fail to start bthread";
+        start_heartbeat(reinterpret_cast<void*>(this));
+    }
+}
+
+HeartbeatQueue::~HeartbeatQueue() { 
+    need_stop_ = false; 
+    while(!is_stop_) {
+        bthread_usleep(1000);
+    }
+    for (const auto& it : channels_) {
+        delete it.second;
+    }
+    bthread_mutex_destroy(&channels_mutex_); 
+    bthread_mutex_destroy(&tasks_mutex_); 
+}
+
+HeartbeatQueue& HeartbeatQueue::GetInstance() {
+  static HeartbeatQueue instance;
+  return instance;
+}
+
+void* HeartbeatQueue::start_heartbeat(void* arg) {
+    HeartbeatQueue* queue = (HeartbeatQueue*)arg;
+    auto due_time = butil::milliseconds_from_now(FLAGS_heartbeat_queue_timer_ms);
+    if (bthread_timer_add(&queue->_heartbeat_timer, due_time,
+                       start_heartbeat_timer, arg) != 0) {
+        start_heartbeat_timer(arg);
+    }
+    return nullptr;
+}
+
+void HeartbeatQueue::start_heartbeat_timer(void* arg) {
+    HeartbeatQueue* queue = (HeartbeatQueue*)arg;
+
+    if (queue->need_stop_) {
+        queue->is_stop_ = true;
+        return;
+    }
+
+    // Get all tasks to send
+    std::vector<HeartbeatTask> tasks_to_send;
+    {
+        BAIDU_SCOPED_LOCK(queue->tasks_mutex_);
+        tasks_to_send.swap(queue->tasks_);
+    }
+
+    if (tasks_to_send.empty()) {
+        trigger_next_heartbeat(queue);
+        return;
+    }
+
+    // Group tasks by channel
+    std::map<std::string, std::vector<HeartbeatTask>> tasks_to_send_by_channel;
+    for (auto &task : tasks_to_send) {
+        std::string endpoint_str = butil::endpoint2str(task.endpoint).c_str();
+        tasks_to_send_by_channel[endpoint_str].push_back(std::move(task));
+    }
+
+    // Send tasks by channel
+    for (auto &tasks_in_one_channel_it : tasks_to_send_by_channel) {
+        brpc::Channel* channel = nullptr;
+        {
+            BAIDU_SCOPED_LOCK(queue->channels_mutex_);
+            if (queue->channels_.find(tasks_in_one_channel_it.first) == queue->channels_.end()) {
+                brpc::ChannelOptions channel_opt;
+                channel_opt.connect_timeout_ms = FLAGS_raft_rpc_channel_connect_timeout_ms;
+                channel_opt.timeout_ms = -1; // We don't need RPC timeout
+
+                channel = new brpc::Channel();
+                if (channel == nullptr) {
+                    LOG(FATAL) << "Fail to create sending channel, endpoint: " << tasks_in_one_channel_it.first;
+                }
+
+                const auto& tmp_task = tasks_in_one_channel_it.second[0];
+
+                if (channel->Init(tmp_task.endpoint, &channel_opt) != 0) {
+                    LOG(FATAL) << "Fail to init sending channel, endpoint: " << tasks_in_one_channel_it.first;
+                    delete channel;
+                }
+                    
+                queue->channels_.insert(std::pair<std::string, brpc::Channel*>(tasks_in_one_channel_it.first, channel));
+            } else {
+                channel = queue->channels_[tasks_in_one_channel_it.first];
+            }
+        }
+
+        RaftService_Stub stub(channel);
+
+        // LOG(WARNING) << "tasks count: " << tasks_in_one_channel_it.second.size() << ", endpoint: " << tasks_in_one_channel_it.first.c_str();
+
+        BatchHeartbeatClosure *done = new BatchHeartbeatClosure;
+        done->cntl.set_timeout_ms(FLAGS_heartbeat_default_timeout_ms);
+        done->tasks.reserve( tasks_in_one_channel_it.second.size() > FLAGS_heartbeat_max_batch_count ? FLAGS_heartbeat_max_batch_count : tasks_in_one_channel_it.second.size());
+
+        for (auto& task : tasks_in_one_channel_it.second) {
+            // add task to batch request & done
+            *(done->batch_request.add_requests()) = *task.request;
+            done->tasks.push_back(std::move(task));
+
+            // set timeout_ms of whole batch request to the max timeout_ms of all tasks
+            if (task.cntl->timeout_ms() > done->cntl.timeout_ms()) {
+                done->cntl.set_timeout_ms(task.cntl->timeout_ms());
+            }
+
+            // if tasks count reach max batch count, send batch request
+            if (done->tasks.size() >= FLAGS_heartbeat_max_batch_count) {
+                // LOG(WARNING) << "send batch request, endpoint: " << butil::endpoint2str(done->tasks[0].endpoint).c_str() << ", tasks count: " << done->tasks.size();
+                stub.batch_append_entries(&done->cntl, &done->batch_request, &done->batch_response, done);
+
+                done = new BatchHeartbeatClosure;
+                done->cntl.set_timeout_ms(FLAGS_heartbeat_default_timeout_ms);
+            }
+        }
+
+        // send last batch request
+        if (done->tasks.size() > 0) {
+            // LOG(WARNING) << "send batch request, endpoint: " << butil::endpoint2str(done->tasks[0].endpoint).c_str() << ", tasks count: " << done->tasks.size();
+            stub.batch_append_entries(&done->cntl, &done->batch_request, &done->batch_response, done);
+        } else {
+            delete done;
+        }
+    }
+
+    // trigger next heartbeat
+    trigger_next_heartbeat(queue);
+}
+
+void HeartbeatQueue::trigger_next_heartbeat(HeartbeatQueue* queue) {
+    const timespec due_time = butil::milliseconds_from_now(FLAGS_heartbeat_queue_timer_ms);
+    if (bthread_timer_add(&queue->_heartbeat_timer, due_time,
+                       start_heartbeat_timer, (void*)(queue)) != 0) {
+        start_heartbeat_timer((void*)(queue));
+    }
+}
+
+void HeartbeatQueue::add_task(HeartbeatTask& task) {
+    BAIDU_SCOPED_LOCK(tasks_mutex_);
+    tasks_.push_back(std::move(task));
+    // LOG(WARNING) << "HeartbeatQueue add task, endpoint: " << butil::endpoint2str(task.endpoint).c_str() << ", task: " << task.request->ShortDebugString();
+}
+
+void BatchHeartbeatClosure::Run() {
+    if (tasks.empty()) {
+        delete this;
+        return;
+    }
+
+    bool is_failed = cntl.Failed();
+
+    if (is_failed) {
+        for (auto &task: tasks) {
+            task.cntl->SetFailed(cntl.ErrorCode(), "%s", cntl.ErrorText().c_str());
+            LOG(WARNING) << "HeartbeatQueue send task failed, endpoint: " << butil::endpoint2str(task.endpoint).c_str() << ", task: " << task.request->ShortDebugString();
+            task.done->Run();
+        }
+    } else {
+        if ((uint64_t)batch_response.responses_size() != tasks.size()) {
+            LOG(WARNING) << "BatchHeartbeatClosure: response size not match, expect: " << tasks.size()
+                        << ", actual: " << batch_response.responses_size();
+            for (auto &task: tasks) {
+                task.cntl->SetFailed(EINVAL, "response size %d is not match tasks size %ld", batch_response.responses_size(), tasks.size());
+                task.done->Run();
+            }
+        } else {
+            for (int i = 0; i < batch_response.responses_size(); ++i) {
+                *tasks[i].response = batch_response.responses(i);
+                // LOG(WARNING) << "HeartbeatQueue send task done, endpoint: " << butil::endpoint2str(tasks[i].endpoint).c_str() << ", task: " << tasks[i].request->ShortDebugString();
+                tasks[i].done->Run();
+            }
+        }
+    }
+
+    delete this;
 }
 
 } //  namespace braft

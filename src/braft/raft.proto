@@ -57,6 +57,14 @@ message AppendEntriesResponse {
     optional bool readonly = 4;
 };
 
+message BatchAppendEntriesRequest {
+  repeated AppendEntriesRequest requests = 1;
+}
+
+message BatchAppendEntriesResponse {
+  repeated AppendEntriesResponse responses = 1;
+}
+
 message SnapshotMeta {
     required int64 last_included_index = 1;
     required int64 last_included_term = 2;
@@ -97,6 +105,8 @@ service RaftService {
     rpc request_vote(RequestVoteRequest) returns (RequestVoteResponse);
 
     rpc append_entries(AppendEntriesRequest) returns (AppendEntriesResponse);
+
+    rpc batch_append_entries(BatchAppendEntriesRequest) returns (BatchAppendEntriesResponse);
 
     rpc install_snapshot(InstallSnapshotRequest) returns (InstallSnapshotResponse);
 

@@ -17,6 +17,7 @@
 
 #include <butil/logging.h>
 #include <brpc/server.h>
+#include <cstddef>
 #include "braft/raft_service.h"
 #include "braft/raft.h"
 #include "braft/node.h"
@@ -111,6 +112,34 @@ void RaftServiceImpl::append_entries(google::protobuf::RpcController* cntl_base,
 
     return node->handle_append_entries_request(cntl, request, response, 
                                                done_guard.release());
+}
+
+void RaftServiceImpl::batch_append_entries(google::protobuf::RpcController* cntl_base,
+                            const BatchAppendEntriesRequest* request,
+                            BatchAppendEntriesResponse* response,
+                            google::protobuf::Closure* done) {
+    brpc::ClosureGuard done_guard(done);
+    brpc::Controller* cntl =
+        static_cast<brpc::Controller*>(cntl_base);
+
+    for(const auto& req : request->requests()) {
+        PeerId peer_id;
+        if (0 != peer_id.parse(req.peer_id())) {
+            cntl->SetFailed(EINVAL, "peer_id invalid");
+            return;
+        }
+
+        scoped_refptr<NodeImpl> node_ptr = 
+                            global_node_manager->get(req.group_id(), peer_id);
+        NodeImpl* node = node_ptr.get();
+        if (!node) {
+            cntl->SetFailed(ENOENT, "peer_id not exist");
+            return;
+        }
+
+        node->handle_append_entries_request(cntl, &req, response->add_responses(), 
+                                                   nullptr);
+    }
 }
 
 void RaftServiceImpl::install_snapshot(google::protobuf::RpcController* cntl_base,

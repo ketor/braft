@@ -19,8 +19,14 @@
 #ifndef  BRAFT_REPLICATOR_H
 #define  BRAFT_REPLICATOR_H
 
+#include <brpc/stream.h>
 #include <bthread/bthread.h>                            // bthread_id
 #include <brpc/channel.h>                  // brpc::Channel
+#include <butil/endpoint.h>
+#include <cstdint>
+#include <map>
+#include <string>
+#include <vector>
 
 #include "braft/storage.h"                       // SnapshotStorage
 #include "braft/raft.h"                          // Closure
@@ -153,6 +159,7 @@ private:
     int _prepare_entry(int offset, EntryMeta* em, butil::IOBuf* data);
     void _wait_more_entries();
     void _send_empty_entries(bool is_heartbeat);
+    void _send_heartbeat_entries();
     void _send_entries();
     void _notify_on_caught_up(int error_code, bool);
     int _fill_common_fields(AppendEntriesRequest* request, int64_t prev_log_index,
@@ -374,6 +381,52 @@ private:
     ReplicatorOptions _common_options;
     int _dynamic_timeout_ms;
     int _election_timeout_ms;
+};
+
+struct HeartbeatTask {
+    butil::EndPoint endpoint;
+    brpc::Controller* cntl;
+    AppendEntriesRequest *request;
+    AppendEntriesResponse *response;
+    google::protobuf::Closure* done;
+};
+
+class HeartbeatQueue {
+public:
+    HeartbeatQueue();
+    ~HeartbeatQueue();
+    
+    static HeartbeatQueue& GetInstance();
+
+    void add_task(HeartbeatTask& task);
+
+    static void on_timedout(void* arg);
+
+    static void start_heartbeat_timer(void* arg);
+
+    static void* start_heartbeat(void* arg);
+
+    static void trigger_next_heartbeat(HeartbeatQueue* queue);
+
+private:
+    bthread_mutex_t tasks_mutex_;
+    std::vector<HeartbeatTask> tasks_;
+
+    bthread_mutex_t channels_mutex_;
+    std::map<std::string, brpc::Channel*> channels_;
+
+    bool need_stop_{false};
+    bool is_stop_{false};
+    bthread_timer_t _heartbeat_timer;
+};
+
+struct BatchHeartbeatClosure : public braft::Closure {
+    void Run() override;
+    brpc::Controller cntl;
+    std::vector<HeartbeatTask> tasks;
+
+    BatchAppendEntriesRequest batch_request;
+    BatchAppendEntriesResponse batch_response;
 };
 
 }  //  namespace braft
