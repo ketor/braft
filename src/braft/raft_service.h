@@ -42,6 +42,11 @@ public:
                                 AppendEntriesResponse* response,
                                 google::protobuf::Closure* done);
 
+    void batch_append_entries(google::protobuf::RpcController *controller,
+                            const BatchAppendEntriesRequest *request,
+                            BatchAppendEntriesResponse *response,
+                            google::protobuf::Closure *done);
+
     void install_snapshot(google::protobuf::RpcController* controller,
                                   const InstallSnapshotRequest* request,
                                   InstallSnapshotResponse* response,

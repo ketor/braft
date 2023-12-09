@@ -19,8 +19,14 @@
 #ifndef  BRAFT_REPLICATOR_H
 #define  BRAFT_REPLICATOR_H
 
+#include <brpc/stream.h>
 #include <bthread/bthread.h>                            // bthread_id
 #include <brpc/channel.h>                  // brpc::Channel
+#include <butil/endpoint.h>
+#include <cstdint>
+#include <map>
+#include <string>
+#include <vector>
 
 #include "braft/storage.h"                       // SnapshotStorage
 #include "braft/raft.h"                          // Closure
@@ -374,6 +380,52 @@ private:
     ReplicatorOptions _common_options;
     int _dynamic_timeout_ms;
     int _election_timeout_ms;
+};
+
+struct HeartbeatTask {
+    butil::EndPoint endpoint;
+    brpc::Controller* cntl;
+    AppendEntriesRequest *request;
+    AppendEntriesResponse *response;
+    google::protobuf::Closure* done;
+};
+
+class HeartbeatQueue {
+public:
+    HeartbeatQueue();
+    ~HeartbeatQueue();
+    
+    static HeartbeatQueue& GetInstance();
+
+    void add_task(HeartbeatTask& task);
+
+    static void on_timedout(void* arg);
+
+    static void start_heartbeat_timer(void* arg);
+
+    static void* start_heartbeat(void* arg);
+
+    static void trigger_next_heartbeat(HeartbeatQueue* queue);
+
+private:
+    bthread_mutex_t tasks_mutex_;
+    std::vector<HeartbeatTask> tasks_;
+
+    bthread_mutex_t channels_mutex_;
+    std::map<std::string, brpc::Channel*> channels_;
+
+    bool need_stop_{false};
+    bool is_stop_{false};
+    bthread_timer_t _heartbeat_timer;
+};
+
+struct BatchHeartbeatClosure : public braft::Closure {
+    void Run() override;
+    brpc::Controller cntl;
+    std::vector<HeartbeatTask> tasks;
+
+    BatchAppendEntriesRequest batch_request;
+    BatchAppendEntriesResponse batch_response;
 };
 
 }  //  namespace braft
