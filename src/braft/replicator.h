@@ -33,6 +33,7 @@
 #include "braft/configuration.h"                 // Configuration
 #include "braft/raft.pb.h"                       // AppendEntriesRequest
 #include "braft/log_manager.h"                   // LogManager
+#include "brpc/controller.h"
 
 namespace braft {
 
@@ -399,7 +400,7 @@ public:
 
     void add_task(HeartbeatTask& task);
 
-    static void on_timedout(void* arg);
+    void join_last_callid();
 
     static void start_heartbeat_timer(void* arg);
 
@@ -417,6 +418,9 @@ private:
     bool need_stop_{false};
     bool is_stop_{false};
     bthread_timer_t _heartbeat_timer;
+
+    bthread_mutex_t last_callids_mutex_;
+    std::vector<brpc::CallId> last_callids;
 };
 
 struct BatchHeartbeatClosure : public braft::Closure {

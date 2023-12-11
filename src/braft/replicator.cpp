@@ -37,6 +37,7 @@
 #include "braft/ballot_box.h"                    // BallotBox 
 #include "braft/log_entry.h"                     // LogEntry
 #include "braft/snapshot_throttle.h"             // SnapshotThrottle
+#include "bthread/types.h"
 
 namespace braft {
 
@@ -63,6 +64,10 @@ DECLARE_int64(raft_append_entry_high_lat_us);
 DECLARE_bool(raft_trace_append_entry_latency);
 
 DECLARE_int32(raft_rpc_channel_connect_timeout_ms);
+
+DEFINE_int32(heartbeat_queue_timer_ms, 200, "heartbeat queue timer in ms");
+DEFINE_int32(heartbeat_default_timeout_ms, 1000, "heartbeat default timeout in ms");
+DEFINE_uint64(heartbeat_max_batch_count, 10000, "heartbeat max batch count");
 
 static bvar::LatencyRecorder g_send_entries_latency("raft_send_entries");
 static bvar::LatencyRecorder g_normalized_send_entries_latency(
@@ -577,7 +582,9 @@ void Replicator::_send_empty_entries(bool is_heartbeat) {
         return _install_snapshot();
     }
     if (is_heartbeat) {
-        _heartbeat_in_fly = cntl->call_id();
+        if (!FLAGS_braft_use_align_hearbeat) {
+            _heartbeat_in_fly = cntl->call_id();
+        }
         _heartbeat_counter++;
         // set RPC timeout for heartbeat, how long should timeout be is waiting to be optimized.
         cntl->set_timeout_ms(*_options.election_timeout_ms / 2);
@@ -602,7 +609,7 @@ void Replicator::_send_empty_entries(bool is_heartbeat) {
                 _id.value, cntl.get(), request.get(), response.get(),
                 butil::monotonic_time_ms());
 
-    if(FLAGS_braft_use_align_hearbeat) {
+    if (FLAGS_braft_use_align_hearbeat && is_heartbeat) {
         // use HeartbeatQueue to send heartbeat
         HeartbeatTask task;
         task.endpoint = this->_options.peer_id.addr;
@@ -1021,7 +1028,11 @@ int Replicator::_on_error(bthread_id_t id, void* arg, int error_code) {
     Replicator* r = (Replicator*)arg;
     if (error_code == ESTOP) {
         brpc::StartCancel(r->_install_snapshot_in_fly);
-        brpc::StartCancel(r->_heartbeat_in_fly);
+        if (!FLAGS_braft_use_align_hearbeat) {
+            brpc::StartCancel(r->_heartbeat_in_fly);
+        } else {
+            HeartbeatQueue::GetInstance().join_last_callid();
+        }
         brpc::StartCancel(r->_timeout_now_in_fly);
         r->_cancel_append_entries_rpcs();
         bthread_timer_del(r->_heartbeat_timer);
@@ -1614,13 +1625,10 @@ bool ReplicatorGroup::readonly(const PeerId& peer) const {
     return Replicator::readonly(rid);
 }
 
-DEFINE_int32(heartbeat_queue_timer_ms, 200, "heartbeat queue timer in ms");
-DEFINE_int32(heartbeat_default_timeout_ms, 1000, "heartbeat default timeout in ms");
-DEFINE_uint64(heartbeat_max_batch_count, 10000, "heartbeat max batch count");
-
 HeartbeatQueue::HeartbeatQueue() { 
     bthread_mutex_init(&tasks_mutex_, nullptr);
     bthread_mutex_init(&channels_mutex_, nullptr);
+    bthread_mutex_init(&last_callids_mutex_, nullptr);
     is_stop_ = false;
     need_stop_ = false;
 
@@ -1634,7 +1642,7 @@ HeartbeatQueue::HeartbeatQueue() {
 
 HeartbeatQueue::~HeartbeatQueue() { 
     need_stop_ = false; 
-    while(!is_stop_) {
+    while (!is_stop_) {
         bthread_usleep(1000);
     }
     for (const auto& it : channels_) {
@@ -1647,6 +1655,14 @@ HeartbeatQueue::~HeartbeatQueue() {
 HeartbeatQueue& HeartbeatQueue::GetInstance() {
   static HeartbeatQueue instance;
   return instance;
+}
+
+void HeartbeatQueue::join_last_callid() {
+    BAIDU_SCOPED_LOCK(last_callids_mutex_);
+    for(const auto& last_callid: last_callids) {
+        brpc::Join(last_callid);
+    }
+    last_callids.clear();
 }
 
 void* HeartbeatQueue::start_heartbeat(void* arg) {
@@ -1667,87 +1683,94 @@ void HeartbeatQueue::start_heartbeat_timer(void* arg) {
         return;
     }
 
-    // Get all tasks to send
-    std::vector<HeartbeatTask> tasks_to_send;
     {
-        BAIDU_SCOPED_LOCK(queue->tasks_mutex_);
-        tasks_to_send.swap(queue->tasks_);
-    }
+        BAIDU_SCOPED_LOCK(queue->last_callids_mutex_);
+        queue->last_callids.clear();
 
-    if (tasks_to_send.empty()) {
-        trigger_next_heartbeat(queue);
-        return;
-    }
-
-    // Group tasks by channel
-    std::map<std::string, std::vector<HeartbeatTask>> tasks_to_send_by_channel;
-    for (auto &task : tasks_to_send) {
-        std::string endpoint_str = butil::endpoint2str(task.endpoint).c_str();
-        tasks_to_send_by_channel[endpoint_str].push_back(std::move(task));
-    }
-
-    // Send tasks by channel
-    for (auto &tasks_in_one_channel_it : tasks_to_send_by_channel) {
-        brpc::Channel* channel = nullptr;
+        // Get all tasks to send
+        std::vector<HeartbeatTask> tasks_to_send;
         {
-            BAIDU_SCOPED_LOCK(queue->channels_mutex_);
-            if (queue->channels_.find(tasks_in_one_channel_it.first) == queue->channels_.end()) {
-                brpc::ChannelOptions channel_opt;
-                channel_opt.connect_timeout_ms = FLAGS_raft_rpc_channel_connect_timeout_ms;
-                channel_opt.timeout_ms = -1; // We don't need RPC timeout
-
-                channel = new brpc::Channel();
-                if (channel == nullptr) {
-                    LOG(FATAL) << "Fail to create sending channel, endpoint: " << tasks_in_one_channel_it.first;
-                }
-
-                const auto& tmp_task = tasks_in_one_channel_it.second[0];
-
-                if (channel->Init(tmp_task.endpoint, &channel_opt) != 0) {
-                    LOG(FATAL) << "Fail to init sending channel, endpoint: " << tasks_in_one_channel_it.first;
-                    delete channel;
-                }
-                    
-                queue->channels_.insert(std::pair<std::string, brpc::Channel*>(tasks_in_one_channel_it.first, channel));
-            } else {
-                channel = queue->channels_[tasks_in_one_channel_it.first];
-            }
+            BAIDU_SCOPED_LOCK(queue->tasks_mutex_);
+            tasks_to_send.swap(queue->tasks_);
         }
 
-        RaftService_Stub stub(channel);
+        if (tasks_to_send.empty()) {
+            trigger_next_heartbeat(queue);
+            return;
+        }
 
-        // LOG(WARNING) << "tasks count: " << tasks_in_one_channel_it.second.size() << ", endpoint: " << tasks_in_one_channel_it.first.c_str();
+        // Group tasks by channel
+        std::map<std::string, std::vector<HeartbeatTask>> tasks_to_send_by_channel;
+        for (auto &task : tasks_to_send) {
+            std::string endpoint_str = butil::endpoint2str(task.endpoint).c_str();
+            tasks_to_send_by_channel[endpoint_str].push_back(std::move(task));
+        }
 
-        BatchHeartbeatClosure *done = new BatchHeartbeatClosure;
-        done->cntl.set_timeout_ms(FLAGS_heartbeat_default_timeout_ms);
-        done->tasks.reserve( tasks_in_one_channel_it.second.size() > FLAGS_heartbeat_max_batch_count ? FLAGS_heartbeat_max_batch_count : tasks_in_one_channel_it.second.size());
+        // Send tasks by channel
+        for (auto &tasks_in_one_channel_it : tasks_to_send_by_channel) {
+            brpc::Channel* channel = nullptr;
+            {
+                BAIDU_SCOPED_LOCK(queue->channels_mutex_);
+                if (queue->channels_.find(tasks_in_one_channel_it.first) == queue->channels_.end()) {
+                    brpc::ChannelOptions channel_opt;
+                    channel_opt.connect_timeout_ms = FLAGS_raft_rpc_channel_connect_timeout_ms;
+                    channel_opt.timeout_ms = -1; // We don't need RPC timeout
 
-        for (auto& task : tasks_in_one_channel_it.second) {
-            // add task to batch request & done
-            *(done->batch_request.add_requests()) = *task.request;
-            done->tasks.push_back(std::move(task));
+                    channel = new brpc::Channel();
+                    if (channel == nullptr) {
+                        LOG(FATAL) << "Fail to create sending channel, endpoint: " << tasks_in_one_channel_it.first;
+                    }
 
-            // set timeout_ms of whole batch request to the max timeout_ms of all tasks
-            if (task.cntl->timeout_ms() > done->cntl.timeout_ms()) {
-                done->cntl.set_timeout_ms(task.cntl->timeout_ms());
+                    const auto& tmp_task = tasks_in_one_channel_it.second[0];
+
+                    if (channel->Init(tmp_task.endpoint, &channel_opt) != 0) {
+                        LOG(FATAL) << "Fail to init sending channel, endpoint: " << tasks_in_one_channel_it.first;
+                        delete channel;
+                    }
+                        
+                    queue->channels_.insert(std::pair<std::string, brpc::Channel*>(tasks_in_one_channel_it.first, channel));
+                } else {
+                    channel = queue->channels_[tasks_in_one_channel_it.first];
+                }
             }
 
-            // if tasks count reach max batch count, send batch request
-            if (done->tasks.size() >= FLAGS_heartbeat_max_batch_count) {
+            RaftService_Stub stub(channel);
+
+            // LOG(WARNING) << "tasks count: " << tasks_in_one_channel_it.second.size() << ", endpoint: " << tasks_in_one_channel_it.first.c_str();
+
+            BatchHeartbeatClosure *done = new BatchHeartbeatClosure;
+            done->cntl.set_timeout_ms(FLAGS_heartbeat_default_timeout_ms);
+            done->tasks.reserve( tasks_in_one_channel_it.second.size() > FLAGS_heartbeat_max_batch_count ? FLAGS_heartbeat_max_batch_count : tasks_in_one_channel_it.second.size());
+
+            for (auto& task : tasks_in_one_channel_it.second) {
+                // add task to batch request & done
+                *(done->batch_request.add_requests()) = *task.request;
+                done->tasks.push_back(std::move(task));
+
+                // set timeout_ms of whole batch request to the max timeout_ms of all tasks
+                if (task.cntl->timeout_ms() > done->cntl.timeout_ms()) {
+                    done->cntl.set_timeout_ms(task.cntl->timeout_ms());
+                }
+
+                // if tasks count reach max batch count, send batch request
+                if (done->tasks.size() >= FLAGS_heartbeat_max_batch_count) {
+                    // LOG(WARNING) << "send batch request, endpoint: " << butil::endpoint2str(done->tasks[0].endpoint).c_str() << ", tasks count: " << done->tasks.size();
+                    queue->last_callids.push_back(done->cntl.call_id());
+                    stub.batch_append_entries(&done->cntl, &done->batch_request, &done->batch_response, done);
+
+                    done = new BatchHeartbeatClosure;
+                    done->cntl.set_timeout_ms(FLAGS_heartbeat_default_timeout_ms);
+                }
+            }
+
+            // send last batch request
+            if (done->tasks.size() > 0) {
                 // LOG(WARNING) << "send batch request, endpoint: " << butil::endpoint2str(done->tasks[0].endpoint).c_str() << ", tasks count: " << done->tasks.size();
+                queue->last_callids.push_back(done->cntl.call_id());
                 stub.batch_append_entries(&done->cntl, &done->batch_request, &done->batch_response, done);
-
-                done = new BatchHeartbeatClosure;
-                done->cntl.set_timeout_ms(FLAGS_heartbeat_default_timeout_ms);
+            } else {
+                delete done;
             }
-        }
-
-        // send last batch request
-        if (done->tasks.size() > 0) {
-            // LOG(WARNING) << "send batch request, endpoint: " << butil::endpoint2str(done->tasks[0].endpoint).c_str() << ", tasks count: " << done->tasks.size();
-            stub.batch_append_entries(&done->cntl, &done->batch_request, &done->batch_response, done);
-        } else {
-            delete done;
         }
     }
 
@@ -1775,11 +1798,9 @@ void BatchHeartbeatClosure::Run() {
         return;
     }
 
-    bool is_failed = cntl.Failed();
-
-    if (is_failed) {
+    if (cntl.Failed()) {
         for (auto &task: tasks) {
-            task.cntl->SetFailed(cntl.ErrorCode(), "%s", cntl.ErrorText().c_str());
+            task.cntl->SetFailed("BatchHeartbeat FAILED");
             LOG(WARNING) << "HeartbeatQueue send task failed, endpoint: " << butil::endpoint2str(task.endpoint).c_str() << ", task: " << task.request->ShortDebugString();
             task.done->Run();
         }
@@ -1788,7 +1809,7 @@ void BatchHeartbeatClosure::Run() {
             LOG(WARNING) << "BatchHeartbeatClosure: response size not match, expect: " << tasks.size()
                         << ", actual: " << batch_response.responses_size();
             for (auto &task: tasks) {
-                task.cntl->SetFailed(EINVAL, "response size %d is not match tasks size %ld", batch_response.responses_size(), tasks.size());
+                task.cntl->SetFailed("BatchHeartbeat FAILED");
                 task.done->Run();
             }
         } else {
