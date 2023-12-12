@@ -38,6 +38,7 @@
 #include "braft/log_entry.h"                     // LogEntry
 #include "braft/snapshot_throttle.h"             // SnapshotThrottle
 #include "bthread/types.h"
+#include "google/protobuf/stubs/callback.h"
 
 namespace braft {
 
@@ -65,7 +66,7 @@ DECLARE_bool(raft_trace_append_entry_latency);
 
 DECLARE_int32(raft_rpc_channel_connect_timeout_ms);
 
-DEFINE_int32(heartbeat_queue_timer_ms, 200, "heartbeat queue timer in ms");
+DEFINE_int32(heartbeat_queue_timer_ms, 100, "heartbeat queue timer in ms");
 DEFINE_int32(heartbeat_default_timeout_ms, 1000, "heartbeat default timeout in ms");
 DEFINE_uint64(heartbeat_max_batch_count, 10000, "heartbeat max batch count");
 
@@ -617,6 +618,7 @@ void Replicator::_send_empty_entries(bool is_heartbeat) {
         task.request = request.release();
         task.response = response.release();
         task.done = done;
+        task.id = _id.value;
 
         HeartbeatQueue::GetInstance().add_task(task);
 
@@ -1031,7 +1033,7 @@ int Replicator::_on_error(bthread_id_t id, void* arg, int error_code) {
         if (!FLAGS_braft_use_align_hearbeat) {
             brpc::StartCancel(r->_heartbeat_in_fly);
         } else {
-            HeartbeatQueue::GetInstance().join_last_callid();
+            HeartbeatQueue::GetInstance().cancel_heartbeat(r->_id.value);
         }
         brpc::StartCancel(r->_timeout_now_in_fly);
         r->_cancel_append_entries_rpcs();
@@ -1628,7 +1630,6 @@ bool ReplicatorGroup::readonly(const PeerId& peer) const {
 HeartbeatQueue::HeartbeatQueue() { 
     bthread_mutex_init(&tasks_mutex_, nullptr);
     bthread_mutex_init(&channels_mutex_, nullptr);
-    bthread_mutex_init(&last_callids_mutex_, nullptr);
     is_stop_ = false;
     need_stop_ = false;
 
@@ -1657,12 +1658,14 @@ HeartbeatQueue& HeartbeatQueue::GetInstance() {
   return instance;
 }
 
-void HeartbeatQueue::join_last_callid() {
-    BAIDU_SCOPED_LOCK(last_callids_mutex_);
-    for(const auto& last_callid: last_callids) {
-        brpc::Join(last_callid);
+void HeartbeatQueue::cancel_heartbeat(uint64_t id) {
+    BAIDU_SCOPED_LOCK(tasks_mutex_);
+    for(auto& task: tasks_) {
+        if (task.id == id) {
+            task.is_canceled = true;
+            break;
+        }
     }
-    last_callids.clear();
 }
 
 void* HeartbeatQueue::start_heartbeat(void* arg) {
@@ -1684,9 +1687,6 @@ void HeartbeatQueue::start_heartbeat_timer(void* arg) {
     }
 
     {
-        BAIDU_SCOPED_LOCK(queue->last_callids_mutex_);
-        queue->last_callids.clear();
-
         // Get all tasks to send
         std::vector<HeartbeatTask> tasks_to_send;
         {
@@ -1698,6 +1698,8 @@ void HeartbeatQueue::start_heartbeat_timer(void* arg) {
             trigger_next_heartbeat(queue);
             return;
         }
+
+        std::vector<HeartbeatTask> canceled_tasks;
 
         // Group tasks by channel
         std::map<std::string, std::vector<HeartbeatTask>> tasks_to_send_by_channel;
@@ -1743,6 +1745,11 @@ void HeartbeatQueue::start_heartbeat_timer(void* arg) {
             done->tasks.reserve( tasks_in_one_channel_it.second.size() > FLAGS_heartbeat_max_batch_count ? FLAGS_heartbeat_max_batch_count : tasks_in_one_channel_it.second.size());
 
             for (auto& task : tasks_in_one_channel_it.second) {
+                if(task.is_canceled) {
+                    canceled_tasks.push_back(task);
+                    continue;
+                }
+
                 // add task to batch request & done
                 *(done->batch_request.add_requests()) = *task.request;
                 done->tasks.push_back(std::move(task));
@@ -1755,7 +1762,6 @@ void HeartbeatQueue::start_heartbeat_timer(void* arg) {
                 // if tasks count reach max batch count, send batch request
                 if (done->tasks.size() >= FLAGS_heartbeat_max_batch_count) {
                     // LOG(WARNING) << "send batch request, endpoint: " << butil::endpoint2str(done->tasks[0].endpoint).c_str() << ", tasks count: " << done->tasks.size();
-                    queue->last_callids.push_back(done->cntl.call_id());
                     stub.batch_append_entries(&done->cntl, &done->batch_request, &done->batch_response, done);
 
                     done = new BatchHeartbeatClosure;
@@ -1766,10 +1772,16 @@ void HeartbeatQueue::start_heartbeat_timer(void* arg) {
             // send last batch request
             if (done->tasks.size() > 0) {
                 // LOG(WARNING) << "send batch request, endpoint: " << butil::endpoint2str(done->tasks[0].endpoint).c_str() << ", tasks count: " << done->tasks.size();
-                queue->last_callids.push_back(done->cntl.call_id());
                 stub.batch_append_entries(&done->cntl, &done->batch_request, &done->batch_response, done);
             } else {
                 delete done;
+            }
+        }
+
+        if(!canceled_tasks.empty()) {
+            for(auto& task: canceled_tasks) {
+                task.cntl->SetFailed("BatchHeartbeat FAILED");
+                task.done->Run();
             }
         }
     }

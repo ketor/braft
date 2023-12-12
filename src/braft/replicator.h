@@ -385,10 +385,12 @@ private:
 
 struct HeartbeatTask {
     butil::EndPoint endpoint;
-    brpc::Controller* cntl;
-    AppendEntriesRequest *request;
-    AppendEntriesResponse *response;
-    google::protobuf::Closure* done;
+    brpc::Controller* cntl{nullptr};
+    AppendEntriesRequest *request{nullptr};
+    AppendEntriesResponse *response{nullptr};
+    google::protobuf::Closure* done{nullptr};
+    uint64_t id{0};
+    bool is_canceled{false};
 };
 
 class HeartbeatQueue {
@@ -400,7 +402,7 @@ public:
 
     void add_task(HeartbeatTask& task);
 
-    void join_last_callid();
+    void cancel_heartbeat(uint64_t id);
 
     static void start_heartbeat_timer(void* arg);
 
@@ -418,9 +420,6 @@ private:
     bool need_stop_{false};
     bool is_stop_{false};
     bthread_timer_t _heartbeat_timer;
-
-    bthread_mutex_t last_callids_mutex_;
-    std::vector<brpc::CallId> last_callids;
 };
 
 struct BatchHeartbeatClosure : public braft::Closure {
