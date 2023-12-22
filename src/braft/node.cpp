@@ -806,6 +806,10 @@ void NodeImpl::check_dead_nodes(const Configuration& conf, int64_t now_ms) {
                 <= _options.election_timeout_ms) {
             ++alive_count;
             continue;
+        } else {
+            LOG(INFO) << "dead peer: " << peers[i].to_string()
+                    << " diff: " << now_ms - _replicator_group.last_rpc_send_timestamp(peers[i])
+                    << " election_timeout_ms: " << _options.election_timeout_ms;
         }
         dead_nodes.add_peer(peers[i]);
     }

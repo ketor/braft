@@ -62,7 +62,13 @@ message BatchAppendEntriesRequest {
 }
 
 message BatchAppendEntriesResponse {
+    message Status {
+        required int32 error_code = 1;
+        optional string error_msg = 2;
+    }
+    
   repeated AppendEntriesResponse responses = 1;
+  repeated Status statuses = 2;
 }
 
 message SnapshotMeta {

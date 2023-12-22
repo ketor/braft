@@ -19,6 +19,7 @@
 #include <brpc/channel.h>
 #include <butil/endpoint.h>
 #include <butil/scoped_lock.h>
+#include <cassert>
 #include <cerrno>
 #include <cstdint>
 #include <gflags/gflags.h>                       // DEFINE_int32
@@ -1713,7 +1714,8 @@ void HeartbeatQueue::start_heartbeat_timer(void* arg) {
             brpc::Channel* channel = nullptr;
             {
                 BAIDU_SCOPED_LOCK(queue->channels_mutex_);
-                if (queue->channels_.find(tasks_in_one_channel_it.first) == queue->channels_.end()) {
+                auto it = queue->channels_.find(tasks_in_one_channel_it.first);
+                if (it == queue->channels_.end()) {
                     brpc::ChannelOptions channel_opt;
                     channel_opt.connect_timeout_ms = FLAGS_raft_rpc_channel_connect_timeout_ms;
                     channel_opt.timeout_ms = -1; // We don't need RPC timeout
@@ -1732,7 +1734,7 @@ void HeartbeatQueue::start_heartbeat_timer(void* arg) {
                         
                     queue->channels_.insert(std::pair<std::string, brpc::Channel*>(tasks_in_one_channel_it.first, channel));
                 } else {
-                    channel = queue->channels_[tasks_in_one_channel_it.first];
+                    channel = it->second;
                 }
             }
 
@@ -1801,7 +1803,6 @@ void HeartbeatQueue::trigger_next_heartbeat(HeartbeatQueue* queue) {
 void HeartbeatQueue::add_task(HeartbeatTask& task) {
     BAIDU_SCOPED_LOCK(tasks_mutex_);
     tasks_.push_back(std::move(task));
-    // LOG(WARNING) << "HeartbeatQueue add task, endpoint: " << butil::endpoint2str(task.endpoint).c_str() << ", task: " << task.request->ShortDebugString();
 }
 
 void BatchHeartbeatClosure::Run() {
@@ -1811,24 +1812,31 @@ void BatchHeartbeatClosure::Run() {
     }
 
     if (cntl.Failed()) {
+        LOG(ERROR) << "send BatchHeartbeat failed,"
+            << " endpoint: " << butil::endpoint2str(tasks[0].endpoint).c_str()
+            << " elapsed_time: " << cntl.latency_us()
+            << " timeout_ms: " << cntl.timeout_ms()
+            << " task count: " << tasks.size()
+            << " error_code: " << cntl.ErrorCode()
+            << " error_msg: " << cntl.ErrorText();
+
         for (auto &task: tasks) {
-            task.cntl->SetFailed("BatchHeartbeat FAILED");
-            LOG(WARNING) << "HeartbeatQueue send task failed, endpoint: " << butil::endpoint2str(task.endpoint).c_str() << ", task: " << task.request->ShortDebugString();
+            task.cntl->SetFailed("BatchHeartbeat failed, " + cntl.ErrorText());
             task.done->Run();
         }
     } else {
-        if ((uint64_t)batch_response.responses_size() != tasks.size()) {
-            LOG(WARNING) << "BatchHeartbeatClosure: response size not match, expect: " << tasks.size()
-                        << ", actual: " << batch_response.responses_size();
-            for (auto &task: tasks) {
-                task.cntl->SetFailed("BatchHeartbeat FAILED");
+        assert(batch_response.responses_size() == tasks.size());
+        assert(batch_response.responses_size() == batch_response.statuses_size());
+
+        for (int i = 0; i < batch_response.responses_size(); ++i) {
+            auto& status = batch_response.statuses(i);
+            auto& task = tasks[i];
+            if (status.error_code() == 0) {
+                *task.response = batch_response.responses(i);
                 task.done->Run();
-            }
-        } else {
-            for (int i = 0; i < batch_response.responses_size(); ++i) {
-                *tasks[i].response = batch_response.responses(i);
-                // LOG(WARNING) << "HeartbeatQueue send task done, endpoint: " << butil::endpoint2str(tasks[i].endpoint).c_str() << ", task: " << tasks[i].request->ShortDebugString();
-                tasks[i].done->Run();
+            } else {
+                task.cntl->SetFailed("BatchHeartbeat failed, " + status.error_msg());
+                task.done->Run();                
             }
         }
     }

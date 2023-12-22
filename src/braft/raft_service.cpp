@@ -18,10 +18,12 @@
 #include <butil/logging.h>
 #include <brpc/server.h>
 #include <cstddef>
+#include <cstdint>
 #include "braft/raft_service.h"
 #include "braft/raft.h"
 #include "braft/node.h"
 #include "braft/node_manager.h"
+#include "glog/logging.h"
 
 namespace braft {
 
@@ -122,24 +124,39 @@ void RaftServiceImpl::batch_append_entries(google::protobuf::RpcController* cntl
     brpc::Controller* cntl =
         static_cast<brpc::Controller*>(cntl_base);
 
+    int64_t start_time = butil::monotonic_time_ms();
     for(const auto& req : request->requests()) {
         PeerId peer_id;
         if (0 != peer_id.parse(req.peer_id())) {
-            cntl->SetFailed(EINVAL, "peer_id invalid");
-            return;
+            auto* mut_response = response->add_responses();
+            mut_response->set_term(0);
+            mut_response->set_success(false);
+            auto* status = response->add_statuses();
+            status->set_error_code(1);
+            status->set_error_msg("peer_id invalid");
+            continue;
         }
 
         scoped_refptr<NodeImpl> node_ptr = 
                             global_node_manager->get(req.group_id(), peer_id);
         NodeImpl* node = node_ptr.get();
         if (!node) {
-            cntl->SetFailed(ENOENT, "peer_id not exist");
-            return;
+            auto* mut_response = response->add_responses();
+            mut_response->set_term(0);
+            mut_response->set_success(false);
+            auto* status = response->add_statuses();
+            status->set_error_code(1);
+            status->set_error_msg("peer_id not exist");
+            continue;
         }
 
+        response->add_statuses()->set_error_code(0);
         node->handle_append_entries_request(cntl, &req, response->add_responses(), 
-                                                   nullptr);
+                                                   nullptr);                                
     }
+    
+    int64_t eplased_time =  butil::monotonic_time_ms() - start_time;
+    LOG_IF(INFO, eplased_time > 1000) << "batch_append_entries size: " << request->requests_size() << " eplased time: " << eplased_time;
 }
 
 void RaftServiceImpl::install_snapshot(google::protobuf::RpcController* cntl_base,
