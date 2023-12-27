@@ -19,6 +19,9 @@
 #include <brpc/server.h>
 #include <cstddef>
 #include <cstdint>
+#include <utility>
+#include <vector>
+#include "braft/raft.pb.h"
 #include "braft/raft_service.h"
 #include "braft/raft.h"
 #include "braft/node.h"
@@ -124,16 +127,24 @@ void RaftServiceImpl::batch_append_entries(google::protobuf::RpcController* cntl
     brpc::Controller* cntl =
         static_cast<brpc::Controller*>(cntl_base);
 
+    // status buffer for response
+    std::vector<BatchAppendEntriesResponse::Status> statuses;
+    // if has error, the statuses will be set to response, else the statuses in response is null.
+    bool has_error = false;
     int64_t start_time = butil::monotonic_time_ms();
-    for(const auto& req : request->requests()) {
+    for (const auto& req : request->requests()) {
         PeerId peer_id;
+        BatchAppendEntriesResponse::Status status;
         if (0 != peer_id.parse(req.peer_id())) {
             auto* mut_response = response->add_responses();
             mut_response->set_term(0);
             mut_response->set_success(false);
-            auto* status = response->add_statuses();
-            status->set_error_code(1);
-            status->set_error_msg("peer_id invalid");
+
+            // prepare status for response
+            status.set_error_code(1);
+            status.set_error_msg("peer_id invalid");
+            statuses.push_back(std::move(status));
+            has_error = true;
             continue;
         }
 
@@ -144,15 +155,29 @@ void RaftServiceImpl::batch_append_entries(google::protobuf::RpcController* cntl
             auto* mut_response = response->add_responses();
             mut_response->set_term(0);
             mut_response->set_success(false);
-            auto* status = response->add_statuses();
-            status->set_error_code(1);
-            status->set_error_msg("peer_id not exist");
+
+            // prepare status for response
+            status.set_error_code(1);
+            status.set_error_msg("peer_id not exist");
+            statuses.push_back(std::move(status));
+            has_error = true;
             continue;
         }
 
-        response->add_statuses()->set_error_code(0);
+        // prepare status for response
+        statuses.push_back(std::move(status));
         node->handle_append_entries_request(cntl, &req, response->add_responses(), 
-                                                   nullptr);                                
+                                                   nullptr);
+    }
+
+    // if has_error, set status to response
+    // else the statuses in response is null.
+    // this is used to save network bandwidth.
+    if (has_error) {
+        for (auto& status : statuses) {
+            auto* mut_status = response->add_statuses();
+            *mut_status = std::move(status);
+        }
     }
     
     int64_t eplased_time =  butil::monotonic_time_ms() - start_time;

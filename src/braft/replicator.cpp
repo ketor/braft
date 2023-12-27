@@ -1826,17 +1826,18 @@ void BatchHeartbeatClosure::Run() {
         }
     } else {
         assert(batch_response.responses_size() == tasks.size());
-        assert(batch_response.responses_size() == batch_response.statuses_size());
+        assert(batch_response.statuses_size() == 0 || batch_response.responses_size() == batch_response.statuses_size());
 
+        BatchAppendEntriesResponse::Status normal_status;
         for (int i = 0; i < batch_response.responses_size(); ++i) {
-            auto& status = batch_response.statuses(i);
+            auto& status = batch_response.statuses_size() > 0 ? batch_response.statuses(i) : normal_status;
             auto& task = tasks[i];
             if (status.error_code() == 0) {
                 *task.response = batch_response.responses(i);
                 task.done->Run();
             } else {
                 task.cntl->SetFailed("BatchHeartbeat failed, " + status.error_msg());
-                task.done->Run();                
+                task.done->Run();
             }
         }
     }
