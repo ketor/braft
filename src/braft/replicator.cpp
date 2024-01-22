@@ -1821,7 +1821,7 @@ void BatchHeartbeatClosure::Run() {
             << " error_msg: " << cntl.ErrorText();
 
         for (auto &task: tasks) {
-            task.cntl->SetFailed("BatchHeartbeat failed, " + cntl.ErrorText());
+            task.cntl->SetFailed("BatchHeartbeat whole batch failed, " + cntl.ErrorText());
             task.done->Run();
         }
     } else {
@@ -1836,7 +1836,7 @@ void BatchHeartbeatClosure::Run() {
                 *task.response = batch_response.responses(i);
                 task.done->Run();
             } else {
-                task.cntl->SetFailed("BatchHeartbeat failed, " + status.error_msg());
+                task.cntl->SetFailed("BatchHeartbeat individual group failed, " + status.error_msg());
                 task.done->Run();
             }
         }

@@ -124,8 +124,6 @@ void RaftServiceImpl::batch_append_entries(google::protobuf::RpcController* cntl
                             BatchAppendEntriesResponse* response,
                             google::protobuf::Closure* done) {
     brpc::ClosureGuard done_guard(done);
-    brpc::Controller* cntl =
-        static_cast<brpc::Controller*>(cntl_base);
 
     // status buffer for response
     std::vector<BatchAppendEntriesResponse::Status> statuses;
@@ -135,13 +133,15 @@ void RaftServiceImpl::batch_append_entries(google::protobuf::RpcController* cntl
     for (const auto& req : request->requests()) {
         PeerId peer_id;
         BatchAppendEntriesResponse::Status status;
+        brpc::Controller cntl;
+
         if (0 != peer_id.parse(req.peer_id())) {
             auto* mut_response = response->add_responses();
             mut_response->set_term(0);
             mut_response->set_success(false);
 
             // prepare status for response
-            status.set_error_code(1);
+            status.set_error_code(EINVAL);
             status.set_error_msg("peer_id invalid");
             statuses.push_back(std::move(status));
             has_error = true;
@@ -157,7 +157,7 @@ void RaftServiceImpl::batch_append_entries(google::protobuf::RpcController* cntl
             mut_response->set_success(false);
 
             // prepare status for response
-            status.set_error_code(1);
+            status.set_error_code(ENOENT);
             status.set_error_msg("peer_id not exist");
             statuses.push_back(std::move(status));
             has_error = true;
@@ -165,9 +165,16 @@ void RaftServiceImpl::batch_append_entries(google::protobuf::RpcController* cntl
         }
 
         // prepare status for response
+        node->handle_append_entries_request(&cntl, &req, response->add_responses(), nullptr);
+        if(cntl.Failed()) {
+            status.set_error_code(cntl.ErrorCode());
+            status.set_error_msg(cntl.ErrorText());
+            has_error = true;
+        } else {
+            status.set_error_code(0);
+            status.set_error_msg("");
+        }
         statuses.push_back(std::move(status));
-        node->handle_append_entries_request(cntl, &req, response->add_responses(), 
-                                                   nullptr);
     }
 
     // if has_error, set status to response
